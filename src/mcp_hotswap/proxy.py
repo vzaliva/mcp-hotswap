@@ -66,6 +66,7 @@ class Pending:
     method: str | None
     key: str | None = None
     cursor: object = None
+    gen: int = 0  # list generation when the request was forwarded
 
 
 @dataclass
@@ -109,6 +110,11 @@ class Proxy:
         self.handshake_reply: tuple[str, dict] | None = None
         self.collect_fd: int | None = None
         self.dirty: set[str] = set()  # lists the server said changed, not yet re-fetched
+        # Bumped by every list_changed from the server. A list reply from a
+        # fetch that began before the latest bump is older than what the
+        # server has announced and must not be stored, even if it arrives
+        # after the newer one.
+        self.gen: dict[str, int] = {}
         self.refresh_tasks: set[asyncio.Task] = set()
         self.expired: set[str] = set()  # internal ids that timed out; late replies are dropped
         self.pinned = False  # a --pin tool was called: no idle stop for this server
@@ -406,7 +412,7 @@ class Proxy:
             cursor = None
             if method in LIST_ITEMS and isinstance(msg.get("params"), dict):
                 cursor = msg["params"].get("cursor")
-            self.client_pending[idkey(msg["id"])] = Pending(method, key, cursor)
+            self.client_pending[idkey(msg["id"])] = Pending(method, key, cursor, self.gen.get(method, 0))
             if method == C.INITIALIZE:
                 self.client_init = msg
             elif method == "logging/setLevel" and isinstance(msg.get("params"), dict):
@@ -619,6 +625,8 @@ class Proxy:
         elif method in CHANGED_NOTIFICATION:
             # Until the cache is re-fetched, these lists go to the live server.
             self.dirty.update(CHANGED_NOTIFICATION[method])
+            for m in CHANGED_NOTIFICATION[method]:
+                self.gen[m] = self.gen.get(m, 0) + 1
             self._start_refresh(child, only=CHANGED_NOTIFICATION[method])
         await self._to_client(raw)
 
@@ -627,6 +635,9 @@ class Proxy:
     def _record(self, pending: Pending, msg: dict) -> None:
         """Store a discovery reply that passed through from the live server."""
         method = pending.method
+        if method in LIST_ITEMS and pending.gen != self.gen.get(method, 0):
+            self.log("reply-superseded", method=method)
+            return
         if method == C.INITIALIZE:
             result = msg.get("result")
             if isinstance(result, dict):
@@ -744,6 +755,7 @@ class Proxy:
             put[handshake[0]] = handshake[1]
             self.handshake_reply = None
         failed: list[str] = []
+        started: dict[str, int] = {}
         # Everything the cache holds, plus what this client was served: a
         # changed handshake may already have dropped those entries from the
         # file, but the client still holds the old replies and must hear
@@ -763,6 +775,7 @@ class Proxy:
             p = dict(params or {})
             if not legacy:
                 p["_meta"] = self.modern_meta
+            started[key] = self.gen.get(method, 0)
             if method == C.DISCOVER:
                 reply = await self._internal(child, method, p, self.opts.refresh_timeout)
                 reply = C.cacheable_reply(method, reply) if reply else None
@@ -774,6 +787,14 @@ class Proxy:
                 put[key] = reply
             else:
                 failed.append(key)
+        # Drop results overtaken by a later list_changed (checked here, with
+        # no await before the cache write below).
+        stale = [k for k in list(put) + failed if started.get(k, 0) != self.gen.get(C.key_parts(k)[1], 0)]
+        if stale:
+            self.log("refresh-superseded", methods=",".join(sorted({C.key_parts(k)[1] for k in stale})))
+            for k in stale:
+                put.pop(k, None)
+            failed = [k for k in failed if k not in stale]
         if only is not None:
             # A list the server declared changed but that could not be
             # fetched again must not be served from the cache: neither now
@@ -786,7 +807,7 @@ class Proxy:
                 self.log("refresh-failed", dropped=",".join(C.key_parts(k)[1] for k in failed))
         if not put or self.child is not child:
             return
-        changed = self.cache.update(put, forget_unchecked=only is None)
+        changed = self.cache.update(put, forget_unchecked=only is None, keep=set(stale))
         self.log("refresh", checked=",".join(C.key_parts(k)[1] for k in put), changed=len(changed))
         if changed:
             self.log("cache-refreshed", changed=",".join(C.key_parts(k)[1] for k in changed))

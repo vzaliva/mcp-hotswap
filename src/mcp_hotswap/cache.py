@@ -208,7 +208,7 @@ class Cache:
                 return reply
         return None
 
-    def update(self, put: dict[str, dict], forget_unchecked: bool = False) -> list[str]:
+    def update(self, put: dict[str, dict], forget_unchecked: bool = False, keep=()) -> list[str]:
         """Merge new replies into the file; return keys whose reply changed.
 
         ``put`` maps key -> reply body. With ``forget_unchecked``, if any
@@ -236,7 +236,7 @@ class Cache:
             dropped = False
             if forget_unchecked and changed:
                 for key in list(entries):
-                    if key not in put:
+                    if key not in put and key not in keep:
                         del entries[key]
                         dropped = True
             if changed or dropped or not os.path.exists(self.path):

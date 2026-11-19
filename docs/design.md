@@ -148,6 +148,12 @@ request, and would then refuse the session.
   immediate re-fetch never gets the old list. If the re-fetch fails, the
   stale entry is dropped from the cache file and those lists keep going to
   the live server.
+- **Ordering.** Each `list_changed` bumps a generation counter for the lists
+  it names. A list reply, from a refresh or from a client request relayed
+  live, is stored only if no `list_changed` for that list arrived after its
+  request was sent. Otherwise it is older than what the server has announced
+  and is discarded, even if it arrives after the newer list. The list stays
+  routed to the live server until a current fetch completes.
 
 ## Idle stop
 

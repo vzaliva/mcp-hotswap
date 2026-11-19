@@ -479,3 +479,57 @@ def test_late_reply_to_timed_out_internal_request_is_not_leaked(env):
     assert not [m for m in seen if str(m.get("id", "")).startswith("mcp-hotswap:")], seen
     assert wait_until(lambda: "late-internal-reply" in env.debug(), 3)
     w.close()
+
+
+def test_older_list_reply_never_overwrites_a_newer_one(env, tmp_path):
+    """Startup refresh asks tools/list; its (old) reply is held back while the
+    server adds a tool and announces it. The newer list must survive the old
+    reply arriving last: in the session, on disk and in the next session."""
+    tools_file = tmp_path / "tools.json"
+    tools_file.write_text(json.dumps(["echo", "add_tool"]))
+    release = tmp_path / "release"
+    env.vars.update(FAKE_TOOLS=str(tools_file), FAKE_LIST_CHANGED="1")
+    primed(env)
+    env.vars["FAKE_HOLD_FIRST_LIST"] = str(release)
+    w = env.wrapper()
+    w.legacy_connect()
+    w.call("echo")  # starts the server; its refresh's tools/list is held
+    pid = env.starts()[-1]
+    assert wait_until(lambda: any(m.get("method") == "tools/list" for m in env.received(pid)), 5)
+    w.call("add_tool", {"name": "fresh"})
+    w.wait_for(lambda m: m.get("method") == "notifications/tools/list_changed")
+    cache_file = next(env.cache.glob("*.json"))
+    assert wait_until(lambda: "fresh" in cache_file.read_text(), 5)
+    release.write_text("go")  # the old reply now arrives
+    assert wait_until(lambda: "refresh-superseded" in env.debug(), 5)
+    assert "fresh" in cache_file.read_text()
+    assert "fresh" in [t["name"] for t in w.request("tools/list")["result"]["tools"]]
+    w.close()
+    del env.vars["FAKE_HOLD_FIRST_LIST"]
+    w = env.wrapper()
+    _, tools = w.legacy_connect()
+    w.close()
+    assert "fresh" in [t["name"] for t in tools["result"]["tools"]]
+    assert len(env.starts()) == 2
+
+
+def test_older_passthrough_list_reply_is_not_recorded(env, tmp_path):
+    """The same ordering rule for a client's own tools/list relayed live."""
+    tools_file = tmp_path / "tools.json"
+    tools_file.write_text(json.dumps(["echo", "add_tool"]))
+    release = tmp_path / "release"
+    env.vars.update(FAKE_TOOLS=str(tools_file), FAKE_LIST_CHANGED="1", FAKE_HOLD_FIRST_LIST=str(release))
+    w = env.wrapper()  # no cache: everything goes to the live server
+    w.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                             "clientInfo": {"name": "t", "version": "1"}}, id_=0)
+    w.notify("notifications/initialized")
+    old = w.request_async("tools/list")  # held: computed now, delivered later
+    w.call("add_tool", {"name": "fresh"})
+    w.wait_for(lambda m: m.get("method") == "notifications/tools/list_changed")
+    assert "fresh" in [t["name"] for t in w.request("tools/list")["result"]["tools"]]
+    release.write_text("go")
+    w.wait_response(old)
+    assert wait_until(lambda: "reply-superseded" in env.debug(), 5)
+    w.close()
+    cache_file = next(env.cache.glob("*.json"))
+    assert "fresh" in cache_file.read_text()

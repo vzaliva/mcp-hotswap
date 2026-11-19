@@ -13,6 +13,8 @@ FAKE_IGNORE_EOF   keep running after stdin closes
 FAKE_IGNORE_TERM  log SIGTERM but keep running
 FAKE_LIST_ERROR   answer tools/list with this error code
 FAKE_PING_ON_INIT ping the client and wait for its answer before answering initialize
+FAKE_HOLD_FIRST_LIST  path: compute the first tools/list reply at once but
+                  deliver it only when this file exists (an old, late reply)
 """
 
 import json
@@ -150,6 +152,16 @@ def list_tools(id_, params, modern):
         result = {"tools": all_tools}
     if modern:
         result.update({"resultType": "complete", "ttlMs": 0, "cacheScope": "private"})
+    hold = os.environ.get("FAKE_HOLD_FIRST_LIST")
+    if hold and not state.get("held"):
+        state["held"] = True
+
+        def later():
+            while not os.path.exists(hold):
+                time.sleep(0.02)
+            reply(id_, result)
+        threading.Thread(target=later, daemon=True).start()
+        return
     reply(id_, result)
 
 
