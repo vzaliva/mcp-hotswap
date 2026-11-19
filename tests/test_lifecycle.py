@@ -568,3 +568,26 @@ def test_pages_within_one_generation_are_still_joined(env, tmp_path):
         cursor = w.request("tools/list", {"cursor": cursor})["result"].get("nextCursor")
     w.close()
     assert "pages=joined" in env.debug()
+
+
+def test_debug_log_traces_commands_and_swaps(env):
+    primed(env)
+    w = env.wrapper("--idle", "0.5s")
+    w.legacy_connect()
+    w.call("echo", {"a": 1})
+    call_id = w.request_async("tools/call", {"name": "ask_roots", "arguments": {}})
+    ask = w.wait_for(lambda m: m.get("method") == "roots/list")
+    w.send({"jsonrpc": "2.0", "id": ask["id"], "result": {"roots": []}})
+    w.wait_response(call_id)
+    pid = env.starts()[-1]
+    assert wait_until(lambda: not alive(pid), 5)
+    w.close()
+    log = env.debug()
+    assert "client name=test-client version=1.0 protocol=2025-11-25" in log
+    assert "request id=0 method=initialize state=cold" in log
+    assert "request id=101 method=tools/call state=cold tool=echo" in log
+    assert "spawn trigger=tools/call" in log
+    assert "reply id=101 method=tools/call ms=" in log and "outcome=ok tool=echo" in log
+    assert "server-request id=" in log and "method=roots/list" in log
+    assert "client-answer id=" in log
+    assert "stop reason=idle" in log and "stopped reason=idle" in log and "how=eof" in log

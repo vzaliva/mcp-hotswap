@@ -1,4 +1,5 @@
-"""Optional debug log: spawns, stops, cache hits and misses, and (with
+"""Optional debug log: one line per request and reply, spawns, stops,
+cache hits and misses, and (with
 ``--trace``) every frame, so it is easy to see what a client sends at
 connect time and whether the cache covers it."""
 
@@ -24,7 +25,7 @@ class Log:
         now = time.time()
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)) + f".{int(now * 1000) % 1000:03d}"
         parts = [stamp, str(self.pid), event]
-        parts += [f"{k}={v}" for k, v in fields.items()]
+        parts += [f"{k}={v}" for k, v in fields.items() if v is not None]
         try:
             self.file.write(" ".join(parts) + "\n")
         except (OSError, ValueError):

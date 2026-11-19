@@ -85,7 +85,7 @@ Options:
 | `--pin TOOL[,TOOL...]` | once one of these tools is called, never idle-stop that server (repeatable) |
 | `--key-env NAME` | env var that changes what the server offers; part of the cache identity (repeatable) |
 | `--key-cwd` | make the working directory part of the cache identity |
-| `--debug-log PATH` | log starts, stops and cache hits/misses (`--trace`: every frame too) |
+| `--debug-log PATH` | log every request and reply (method, tool, latency, outcome), starts, stops and cache hits/misses (`--trace`: every frame too) |
 | `--cache-dir DIR` | default `$XDG_CACHE_HOME/mcp-hotswap`, else `~/.cache/mcp-hotswap` |
 | `--start-timeout`, `--stop-grace`, `--kill-grace` | handshake timeout (120s); wait after closing stdin (2s) and after SIGTERM (3s) |
 | `--show-cache` | print the cache file and its entries for the command, then exit |

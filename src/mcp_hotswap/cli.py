@@ -48,7 +48,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-cache", action="store_true",
                    help="never answer from or write the cache (plain pass-through)")
     p.add_argument("--debug-log", metavar="PATH",
-                   help="append spawns, stops, cache hits and misses to PATH")
+                   help="append one line per client request and reply (method, tool, "
+                        "latency, outcome), cache hits and misses, spawns and stops to PATH")
     p.add_argument("--trace", action="store_true",
                    help="with --debug-log, also record every frame in both directions")
     p.add_argument("--start-timeout", type=duration, default=120.0, metavar="DURATION",

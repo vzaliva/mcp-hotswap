@@ -210,7 +210,13 @@ directly. The wrapper writes to stderr only when something goes wrong (it
 cannot start the server, the handshake fails, the server exits unexpectedly).
 `--debug-log PATH` records every start (with the method that triggered it),
 stop (with reason and how it ended), cache hit and miss, refresh and signal.
-Add `--trace` to record every frame in both directions. A `spawn` line whose
+It also keeps a command trail without message bodies: a `client` line (name,
+version, protocol), a `request` line per client request (id, method, tool
+name or resource, wrapper state), a `reply` line when the server answers
+(latency from the client's request, including any server start, and
+`ok`, `tool-error` or `error:<code>`), `error-reply` for requests the wrapper
+answered with an error, and `server-request`, `server-notification`,
+`client-answer` and `notification` lines for the other directions. Add `--trace` to record every frame in both directions. A `spawn` line whose
 trigger is a discovery method in a session that already has a cache means
 the client sent something at connect time that the cache does not cover.
 

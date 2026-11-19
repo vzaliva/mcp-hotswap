@@ -18,6 +18,7 @@ import os
 import secrets
 import signal
 import sys
+import time
 from dataclasses import dataclass, field
 
 from . import cache as C
@@ -67,6 +68,8 @@ class Pending:
     key: str | None = None
     cursor: object = None
     gen: int = 0  # list generation when the request was forwarded
+    tool: str | None = None
+    t0: float = 0.0
 
 
 @dataclass
@@ -144,6 +147,8 @@ class Proxy:
         self.last_activity = 0.0
         self.idle_task: asyncio.Task | None = None
         self.closing_reason: str | None = None
+        self.client_logged = False
+        self.received_at: dict[str, float] = {}  # request id -> when the client sent it
 
     # ------------------------------------------------------------------ setup
 
@@ -228,6 +233,7 @@ class Proxy:
         if not has_id:
             await self._client_notification(raw, msg, method)
             return
+        self._log_request(msg, method)
         self._note_meta(msg)
         if self.state == "running" and not await self._answer_locally(msg, method):
             await self._forward_request(raw, msg)
@@ -256,6 +262,26 @@ class Proxy:
         await self._to_client(encode({"jsonrpc": "2.0", "id": msg["id"], **reply}))
         return True
 
+    def _log_request(self, msg: dict, method: str) -> None:
+        """One line per client request: the trail of what the client asked."""
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        if not self.client_logged:
+            meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+            info = params.get("clientInfo") if method == C.INITIALIZE else meta.get("io.modelcontextprotocol/clientInfo")
+            if isinstance(info, dict):
+                self.client_logged = True
+                version = params.get("protocolVersion") if method == C.INITIALIZE else meta.get(C.META_VERSION)
+                self.log("client", name=info.get("name"), version=info.get("version"), protocol=version)
+        fields = {"id": json.dumps(msg.get("id")), "method": method, "state": self.state}
+        if method == "tools/call":
+            fields["tool"] = params.get("name")
+        elif method in ("resources/read", "prompts/get"):
+            fields["target"] = params.get("uri") or params.get("name")
+        self.log("request", **fields)
+        if len(self.received_at) > 10000:
+            self.received_at.clear()
+        self.received_at[idkey(msg.get("id"))] = time.monotonic()
+
     def _note_meta(self, msg: dict) -> None:
         params = msg.get("params")
         meta = params.get("_meta") if isinstance(params, dict) else None
@@ -267,6 +293,7 @@ class Proxy:
         """The client answering a server-to-client request."""
         k = idkey(msg.get("id"))
         asked = k in self.server_pending
+        self.log("client-answer", id=json.dumps(msg.get("id")), error=(msg.get("error") or {}).get("code") if isinstance(msg.get("error"), dict) else None)
         self.server_pending.discard(k)
         if self.child is not None and (self.state == "running" or (self.state == "starting" and asked)):
             # While starting, the server may ask something (a ping) before it
@@ -280,6 +307,11 @@ class Proxy:
             self.log("drop", what="client-response", id=msg.get("id"))
 
     async def _client_notification(self, raw: bytes, msg: dict, method: str) -> None:
+        if method == "notifications/cancelled":
+            p = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+            self.log("notification", method=method, id=json.dumps(p.get("requestId")))
+        elif method != "notifications/progress":
+            self.log("notification", method=method)
         if method == "notifications/initialized":
             self.client_initialized = True
             if self.state == "running":
@@ -413,7 +445,12 @@ class Proxy:
             cursor = None
             if method in LIST_ITEMS and isinstance(msg.get("params"), dict):
                 cursor = msg["params"].get("cursor")
-            self.client_pending[idkey(msg["id"])] = Pending(method, key, cursor, self.gen.get(method, 0))
+            tool = None
+            if method == "tools/call" and isinstance(msg.get("params"), dict):
+                tool = msg["params"].get("name")
+            k = idkey(msg["id"])
+            self.client_pending[k] = Pending(method, key, cursor, self.gen.get(method, 0),
+                                             tool, self.received_at.pop(k, time.monotonic()))
             if method == C.INITIALIZE:
                 self.client_init = msg
             elif method == "logging/setLevel" and isinstance(msg.get("params"), dict):
@@ -517,6 +554,7 @@ class Proxy:
         queued, self.queue, self.queue_bytes = self.queue, [], 0
         for _, msg in queued:
             if isinstance(msg, dict) and "method" in msg and "id" in msg:
+                self.log("error-reply", id=json.dumps(msg["id"]), method=msg.get("method"), code=code, why=json.dumps(message))
                 await self._to_client(error_frame(msg["id"], code, message, data))
             elif isinstance(msg, list):
                 for item in msg:
@@ -575,6 +613,7 @@ class Proxy:
             lost = list(self.client_pending.keys())
             self.client_pending.clear()
             for k in lost:
+                self.log("error-reply", id=k, code=-32603, why="server-exited")
                 await self._to_client(error_frame(json.loads(k), -32603, "mcp-hotswap: the MCP server exited before answering"))
             if self.state == "starting":
                 await self._fail_queue(-32603, "mcp-hotswap: the MCP server exited during startup")
@@ -615,9 +654,23 @@ class Proxy:
             pending = self.client_pending.pop(idkey(id_), None)
             await self._to_client(raw)
             if pending is not None:
+                err = msg.get("error") if isinstance(msg.get("error"), dict) else None
+                result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
+                outcome = f"error:{err.get('code')}" if err else ("tool-error" if result.get("isError") else "ok")
+                fields = {"id": json.dumps(id_), "method": pending.method, "ms": int((time.monotonic() - pending.t0) * 1000),
+                          "outcome": outcome}
+                if pending.tool:
+                    fields["tool"] = pending.tool
+                self.log("reply", **fields)
                 self._record(pending, msg)
+            else:
+                self.log("reply", id=json.dumps(id_), method="?", outcome="unmatched")
             return
         self._touch()
+        if "id" in msg:
+            self.log("server-request", id=json.dumps(msg["id"]), method=method)
+        elif method not in ("notifications/progress", "notifications/message"):
+            self.log("server-notification", method=method)
         if "id" in msg:
             self.server_pending.add(idkey(msg["id"]))
         elif method == "notifications/cancelled":
