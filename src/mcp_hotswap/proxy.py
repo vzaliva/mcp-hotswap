@@ -77,6 +77,7 @@ class Pages:
     first: dict
     items: list = field(default_factory=list)
     next: object = None
+    gen: int = 0  # list generation of the first page; all pages must share it
 
 
 def idkey(value) -> str:
@@ -627,6 +628,9 @@ class Proxy:
             self.dirty.update(CHANGED_NOTIFICATION[method])
             for m in CHANGED_NOTIFICATION[method]:
                 self.gen[m] = self.gen.get(m, 0) + 1
+                # Pages collected so far describe the old list; never join
+                # them with pages of the new one.
+                self.pages.pop(m, None)
             self._start_refresh(child, only=CHANGED_NOTIFICATION[method])
         await self._to_client(raw)
 
@@ -653,7 +657,7 @@ class Proxy:
             return
         if method in LIST_ITEMS and isinstance(msg.get("result"), dict) and msg["result"].get("nextCursor"):
             self.pages[method] = Pages(pending.key, msg["result"], list(msg["result"].get(LIST_ITEMS[method]) or []),
-                                       msg["result"]["nextCursor"])
+                                       msg["result"]["nextCursor"], pending.gen)
             return
         reply = C.cacheable_reply(method, msg)
         if reply is not None:
@@ -667,7 +671,8 @@ class Proxy:
     def _collect_page(self, method: str, msg: dict, cursor) -> None:
         pages = self.pages.get(method)
         result = msg.get("result")
-        if pages is None or pages.next != cursor or not isinstance(result, dict):
+        if (pages is None or pages.next != cursor or not isinstance(result, dict)
+                or pages.gen != self.gen.get(method, 0)):
             self.pages.pop(method, None)
             return
         pages.items += list(result.get(LIST_ITEMS[method]) or [])

@@ -153,7 +153,9 @@ request, and would then refuse the session.
   live, is stored only if no `list_changed` for that list arrived after its
   request was sent. Otherwise it is older than what the server has announced
   and is discarded, even if it arrives after the newer list. The list stays
-  routed to the live server until a current fetch completes.
+  routed to the live server until a current fetch completes. Pages a client
+  fetches are joined into one cached list only if they all belong to the same
+  generation; a `list_changed` discards a partial collection.
 
 ## Idle stop
 

@@ -533,3 +533,38 @@ def test_older_passthrough_list_reply_is_not_recorded(env, tmp_path):
     w.close()
     cache_file = next(env.cache.glob("*.json"))
     assert "fresh" in cache_file.read_text()
+
+
+def test_pages_from_before_and_after_list_changed_are_not_joined(env, tmp_path):
+    tools_file = tmp_path / "tools.json"
+    tools_file.write_text(json.dumps(["echo", "add_tool", "old", "tail"]))
+    env.vars.update(FAKE_TOOLS=str(tools_file), FAKE_LIST_CHANGED="1", FAKE_PAGE_SIZE="2")
+    w = env.wrapper()  # no cache: pages pass through and are joined
+    w.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                             "clientInfo": {"name": "t", "version": "1"}}, id_=0)
+    w.notify("notifications/initialized")
+    first = w.request("tools/list")
+    assert [t["name"] for t in first["result"]["tools"]] == ["echo", "add_tool"]
+    tools_file.write_text(json.dumps(["new", "tail"]))
+    w.call("add_tool", {"name": "fresh"})  # catalog is now new, tail, fresh
+    w.wait_for(lambda m: m.get("method") == "notifications/tools/list_changed")
+    rest = w.request("tools/list", {"cursor": first["result"]["nextCursor"]})
+    assert [t["name"] for t in rest["result"]["tools"]] == ["fresh"]
+    w.close()
+    assert "pages=joined" not in env.debug()
+    w = env.wrapper()
+    _, tools = w.legacy_connect()  # must come from a real server, not a mixed cache
+    w.close()
+    assert [t["name"] for t in tools["result"]["tools"]] == ["new", "tail"]
+    assert len(env.starts()) == 2
+
+
+def test_pages_within_one_generation_are_still_joined(env, tmp_path):
+    env.vars.update(FAKE_PAGE_SIZE="2", FAKE_LIST_CHANGED="1")
+    w = env.wrapper()
+    w.legacy_connect()
+    cursor = "2"
+    while cursor:
+        cursor = w.request("tools/list", {"cursor": cursor})["result"].get("nextCursor")
+    w.close()
+    assert "pages=joined" in env.debug()
