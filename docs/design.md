@@ -99,7 +99,12 @@ protocol era:
   wrapper sends the client's `initialize` params with the protocol version
   it already gave the client, under an id like `mcp-hotswap:1`. Then come
   `notifications/initialized` (if the client sent it) and the remembered
-  `logging/setLevel`. Replies to `mcp-hotswap:` ids are swallowed. If the
+  `logging/setLevel`. Internal ids are `mcp-hotswap:<random>:<n>`, never
+  equal to an outstanding client id. A server reply goes to the wrapper only
+  if its id exactly matches an outstanding internal request; any other reply,
+  even one whose id starts with `mcp-hotswap:`, goes to the client. If
+  the server asks the client something (e.g. a ping) before it answers the
+  replayed `initialize`, the client's answer is relayed at once, not queued. If the
   server rejects `initialize`, the error goes back to every queued request
   under the client's ids, and the server is stopped.
 - **Modern** (requests carry `_meta`): no handshake, because each request
@@ -121,6 +126,11 @@ never sends `server/discover` to its server: a dual-era server such as
 mcp-dblp switches a process to the modern protocol once it sees one modern
 request, and would then refuse the session.
 
+- **The replayed `initialize` reply differs from the cache**: this is saved
+  at once (dropping entries that cannot be re-checked), before the queued
+  requests are released. A session that ends straight after its first call
+  still leaves a corrected cache. At client EOF the wrapper also gives a
+  running refresh up to 2 s to finish.
 - **Something changed**: the cache is rewritten, and entries that could not
   be re-checked (other versions, the other era's probe) are dropped, to be
   learned again from the real server the next time a client asks. This is
@@ -132,7 +142,9 @@ request, and would then refuse the session.
 - **The server sends a `list_changed` itself**: the notification is
   forwarded, the affected lists are fetched again into the cache, and until
   that finishes the client's requests for them go to the live server, so an
-  immediate re-fetch never gets the old list.
+  immediate re-fetch never gets the old list. If the re-fetch fails, the
+  stale entry is dropped from the cache file and those lists keep going to
+  the live server.
 
 ## Idle stop
 
@@ -141,6 +153,14 @@ nothing is in flight (client requests, server-to-client requests, our own
 internal requests, queued requests), and nothing has been relayed for `T`.
 `ping` and discovery answered from the cache do not count as activity. A
 client that polls them neither starts the server nor keeps it alive.
+
+`--pin TOOL[,TOOL...]` (repeatable) names tools that create state the
+server must keep. Once a `tools/call` for one of them is forwarded, idle
+stop is off for that server process. The pin ends only when the process
+ends for another reason (crash or session end), because the state is then
+gone anyway. For scholar-mcp, pinning `ingest_paper_fulltext` covers the
+ingestion jobs, which keep running after the call has answered, so the
+in-flight rule alone does not protect them.
 
 The stop is the normal stop sequence. The next request starts the server
 again exactly as above, replaying the handshake for legacy sessions, so the
@@ -199,6 +219,7 @@ the client sent something at connect time that the cache does not cover.
 - **A changed server does not close the connection** (as mcp-doze does). The
   queue is released first, and the refresh corrects the cache in the
   background.
+- **`--pin`** for servers where only some tools create state.
 - **Collector lock on cache misses**: concurrent first sessions (or
   sub-agents) start one server, not one each.
 - **Batches** are relayed to a started server and never crash the wrapper.

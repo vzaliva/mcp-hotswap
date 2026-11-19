@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import signal
 import sys
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from .child import LINE_LIMIT, Child
 from .log import Log
 
 INTERNAL_PREFIX = "mcp-hotswap:"
+REFRESH_WAIT = 2.0  # at client EOF, how long a running cache refresh may finish
 QUEUE_LIMIT = 64 * 1024 * 1024
 SIGNAL_EOF_GRACE = 0.25
 COLLECT_WAIT = 15.0  # how long a first session waits for another to build the cache
@@ -56,6 +58,7 @@ class Options:
     eof_grace: float = 2.0
     term_grace: float = 3.0
     refresh_timeout: float = 30.0
+    pin: frozenset = frozenset()
 
 
 @dataclass
@@ -106,6 +109,11 @@ class Proxy:
         self.handshake_reply: tuple[str, dict] | None = None
         self.collect_fd: int | None = None
         self.dirty: set[str] = set()  # lists the server said changed, not yet re-fetched
+        self.refresh_tasks: set[asyncio.Task] = set()
+        self.pinned = False  # a --pin tool was called: no idle stop for this server
+        # Internal ids carry a per-process random part, so a client cannot
+        # pick one by accident; replies are routed by exact id, not prefix.
+        self.internal_base = f"{INTERNAL_PREFIX}{secrets.token_hex(4)}:"
         self.done = asyncio.Event()
 
         # Session state, as seen by the client.
@@ -249,8 +257,13 @@ class Proxy:
 
     async def _client_response(self, raw: bytes, msg: dict) -> None:
         """The client answering a server-to-client request."""
-        self.server_pending.discard(idkey(msg.get("id")))
-        if self.state == "running" and self.child is not None:
+        k = idkey(msg.get("id"))
+        asked = k in self.server_pending
+        self.server_pending.discard(k)
+        if self.child is not None and (self.state == "running" or (self.state == "starting" and asked)):
+            # While starting, the server may ask something (a ping) before it
+            # answers the replayed initialize: relay the answer at once, or
+            # each side waits for the other.
             self._touch()
             await self._to_child(raw)
         elif self.state == "starting":
@@ -397,6 +410,12 @@ class Proxy:
                 self.client_init = msg
             elif method == "logging/setLevel" and isinstance(msg.get("params"), dict):
                 self.log_level = msg["params"]
+            elif method == "tools/call" and self.opts.pin and not self.pinned:
+                params = msg.get("params")
+                name = params.get("name") if isinstance(params, dict) else None
+                if name in self.opts.pin:
+                    self.pinned = True
+                    self.log("pinned", tool=name)
         elif method == "notifications/initialized":
             self.client_initialized = True
         self._touch()
@@ -447,7 +466,7 @@ class Proxy:
                 await self._to_child(raw)
         self.log("ready", pid=child.pid, flushed=len(queued))
         if replay or (self.modern_meta is not None and self.client_init is None and self.served):
-            asyncio.ensure_future(self._refresh(child))
+            self._start_refresh(child)
 
     async def _replay_handshake(self, child: Child) -> bool:
         params = dict(self.client_init.get("params") or {})
@@ -467,6 +486,12 @@ class Proxy:
             self.log("version-changed", served=self.negotiated, now=result.get("protocolVersion"))
         key = C.request_key(self.client_init, None)
         self.handshake_reply = (key, {"result": result})
+        if self.cache.get(key) is not None and C.dumps(self.cache.get(key)) != C.dumps({"result": result}):
+            # The server changed. Record it now, forgetting what cannot be
+            # re-checked, so the next session re-learns it even if this one
+            # ends before the background refresh completes.
+            self.cache.update({key: {"result": result}}, forget_unchecked=True)
+            self.log("cache-refreshed", changed="initialize")
         if self.client_initialized:
             await child.send(encode({"jsonrpc": "2.0", "method": "notifications/initialized"}))
         if self.log_level is not None:
@@ -506,6 +531,7 @@ class Proxy:
         self.server_pending.clear()
         self.pages.clear()
         self.dirty.clear()
+        self.pinned = False  # whatever it held is gone with it
         self._end_collect()
         if self.state == "closing":
             return
@@ -558,9 +584,9 @@ class Proxy:
         method = msg.get("method")
         if method is None:
             id_ = msg.get("id")
-            if isinstance(id_, str) and id_.startswith(INTERNAL_PREFIX):
-                fut = self.internal.pop(id_, None)
-                if fut is not None and not fut.done():
+            if isinstance(id_, str) and id_ in self.internal and idkey(id_) not in self.client_pending:
+                fut = self.internal.pop(id_)
+                if not fut.done():
                     fut.set_result(msg)
                 return
             self._touch()
@@ -578,7 +604,7 @@ class Proxy:
         elif method in CHANGED_NOTIFICATION:
             # Until the cache is re-fetched, these lists go to the live server.
             self.dirty.update(CHANGED_NOTIFICATION[method])
-            asyncio.ensure_future(self._refresh(child, only=CHANGED_NOTIFICATION[method]))
+            self._start_refresh(child, only=CHANGED_NOTIFICATION[method])
         await self._to_client(raw)
 
     # ---------------------------------------------------------- cache upkeep
@@ -605,6 +631,7 @@ class Proxy:
             return
         reply = C.cacheable_reply(method, msg)
         if reply is not None:
+            self.dirty.discard(method)
             changed = self.cache.update({pending.key: reply})
             if changed:
                 self.log("cache-store", method=method)
@@ -628,8 +655,11 @@ class Proxy:
             self._end_collect()
 
     async def _internal(self, child: Child, method: str, params, timeout: float) -> dict | None:
-        self.internal_seq += 1
-        id_ = f"{INTERNAL_PREFIX}{self.internal_seq}"
+        while True:
+            self.internal_seq += 1
+            id_ = f"{self.internal_base}{self.internal_seq}"
+            if idkey(id_) not in self.client_pending:
+                break
         fut = asyncio.get_running_loop().create_future()
         self.internal[id_] = fut
         msg = {"jsonrpc": "2.0", "id": id_, "method": method}
@@ -672,6 +702,11 @@ class Proxy:
                 return {"result": full}
         return None
 
+    def _start_refresh(self, child: Child, only: tuple[str, ...] | None = None) -> None:
+        task = asyncio.ensure_future(self._refresh(child, only))
+        self.refresh_tasks.add(task)
+        task.add_done_callback(self.refresh_tasks.discard)
+
     async def _refresh(self, child: Child, only: tuple[str, ...] | None = None) -> None:
         """Re-ask the live server everything the cache holds for this session.
 
@@ -692,6 +727,7 @@ class Proxy:
         if legacy and handshake and only is None:
             put[handshake[0]] = handshake[1]
             self.handshake_reply = None
+        failed: list[str] = []
         for key in list(self.cache.entries):
             if self.child is not child or self.state == "closing":
                 return
@@ -714,8 +750,18 @@ class Proxy:
                 continue
             if reply is not None:
                 put[key] = reply
+            else:
+                failed.append(key)
         if only is not None:
-            self.dirty.difference_update(only)
+            # A list the server declared changed but that could not be
+            # fetched again must not be served from the cache: neither now
+            # (it stays dirty, so requests go to the live server) nor in a
+            # later session (its entry is dropped).
+            refreshed = {C.key_parts(k)[1] for k in put}
+            self.dirty.difference_update(m for m in only if m in refreshed and not any(C.key_parts(k)[1] == m for k in failed))
+            if failed:
+                self.cache.forget(failed)
+                self.log("refresh-failed", dropped=",".join(C.key_parts(k)[1] for k in failed))
         if not put or self.child is not child:
             return
         changed = self.cache.update(put, forget_unchecked=only is None)
@@ -770,7 +816,7 @@ class Proxy:
                 wait = min(idle, 1.0)
             await asyncio.sleep(wait)
             child = self.child
-            if self.state != "running" or child is None or self._busy():
+            if self.state != "running" or child is None or self._busy() or self.pinned:
                 continue
             if loop.time() - self.last_activity >= idle:
                 await self._stop_child(child, "idle")
@@ -787,6 +833,10 @@ class Proxy:
         if self.closing_reason is not None:
             return
         self.closing_reason = reason
+        if not fast and self.refresh_tasks:
+            # Let a cache refresh in progress finish (bounded), so what it
+            # learned about a changed server is not lost.
+            await asyncio.wait(list(self.refresh_tasks), timeout=REFRESH_WAIT)
         self.state = "closing"
         if self.start_task is not None and not self.start_task.done() and self.child is None:
             # A spawn is under way: let it produce the process so it can be stopped.

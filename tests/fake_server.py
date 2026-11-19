@@ -12,6 +12,7 @@ FAKE_START_DELAY  seconds to sleep before reading stdin
 FAKE_IGNORE_EOF   keep running after stdin closes
 FAKE_IGNORE_TERM  log SIGTERM but keep running
 FAKE_LIST_ERROR   answer tools/list with this error code
+FAKE_PING_ON_INIT ping the client and wait for its answer before answering initialize
 """
 
 import json
@@ -106,8 +107,11 @@ def call_tool(id_, params, modern):
         path = os.environ["FAKE_TOOLS"]
         with open(path) as f:
             names = json.load(f)
-        with open(path, "w") as f:
+        with open(path + ".tmp", "w") as f:  # atomic: a list may be read concurrently
             json.dump(names + [args["name"]], f)
+        os.replace(path + ".tmp", path)
+        if args.get("break_list"):
+            state["list_broken"] = True
         send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
         text = "added"
     elif name == "crash":
@@ -123,7 +127,7 @@ def call_tool(id_, params, modern):
 
 
 def list_tools(id_, params, modern):
-    code = os.environ.get("FAKE_LIST_ERROR")
+    code = os.environ.get("FAKE_LIST_ERROR") or ("-32603" if state.get("list_broken") else None)
     if code:
         reply(id_, error={"code": int(code), "message": "list failed"})
         return
@@ -173,7 +177,16 @@ def handle(msg):
         state["era"] = "legacy"
         asked = params.get("protocolVersion")
         version = asked if asked in LEGACY else LEGACY[0]
-        reply(id_, {"protocolVersion": version, "capabilities": caps(), "serverInfo": server_info()})
+        answer = {"protocolVersion": version, "capabilities": caps(), "serverInfo": server_info()}
+        if os.environ.get("FAKE_PING_ON_INIT"):
+            def ping_first():
+                if ask_client("ping", {}) is None:
+                    log("ping-unanswered")
+                    return
+                reply(id_, answer)
+            threading.Thread(target=ping_first, daemon=True).start()
+            return
+        reply(id_, answer)
         return
     if method == "ping":
         reply(id_, {})

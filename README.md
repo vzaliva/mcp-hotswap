@@ -82,6 +82,7 @@ Options:
 | option | meaning |
 |---|---|
 | `--idle 15m` | stop the server after 15 minutes idle (default: never) |
+| `--pin TOOL[,TOOL...]` | once one of these tools is called, never idle-stop that server (repeatable) |
 | `--key-env NAME` | env var that changes what the server offers; part of the cache identity (repeatable) |
 | `--key-cwd` | make the working directory part of the cache identity |
 | `--debug-log PATH` | log starts, stops and cache hits/misses (`--trace`: every frame too) |
@@ -102,10 +103,24 @@ server starts; after that the cache is corrected.
 Idle stop is off by default. A stopped server loses everything it held in
 memory: background jobs, open sessions, anything set up by earlier calls.
 Only use `--idle` for servers whose calls are independent, such as mcp-dblp.
-Leave it off, or make it long, for servers that keep state between calls,
-such as scholar-mcp, whose `ingest_paper_fulltext` jobs live in memory until
-`get_ingestion_status` reads them. A running request blocks the stop, but a
-background job the server started on its own does not.
+A running request blocks the stop, but a background job the server started
+on its own does not.
+
+For servers where only some tools create state, name those tools with
+`--pin`. Once one of them is called, the server stays up for the rest of the
+session, while sessions that use only the other tools still unload.
+scholar-mcp keeps ingested papers in memory: `ingest_paper_fulltext` starts
+a background job, and `get_ingestion_status` and
+`extract_granular_paper_details` read its results. Its other tools take
+everything from their arguments:
+
+```json
+"args": ["--idle", "15m", "--pin", "ingest_paper_fulltext", "--",
+         "scholar-mcp", "--transport=stdio"]
+```
+
+`--pin` accepts several tools, comma-separated or as repeated flags. Pin
+every tool that creates state the server must keep.
 
 See [docs/design.md](docs/design.md) for how it works and
 [docs/prior-art.md](docs/prior-art.md) for the lessons taken from similar

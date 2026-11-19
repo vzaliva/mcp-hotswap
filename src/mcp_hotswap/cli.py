@@ -34,6 +34,9 @@ def parser() -> argparse.ArgumentParser:
                    help="stop the server after this long with nothing in flight and "
                         "nothing relayed (default: never). Do not use with servers "
                         "that keep state between calls.")
+    p.add_argument("--pin", action="append", default=[], metavar="TOOL[,TOOL...]",
+                   help="once one of these tools is called, never idle-stop that "
+                        "server (it may hold state the tool created); repeatable")
     p.add_argument("--key-env", action="append", default=[], metavar="NAME",
                    help="include this env var in the cache identity (repeatable); "
                         "name the variables that change what the server offers, "
@@ -98,5 +101,6 @@ def main(argv: list[str] | None = None) -> None:
         start_timeout=args.start_timeout,
         eof_grace=args.stop_grace,
         term_grace=args.kill_grace,
+        pin=frozenset(t.strip() for item in args.pin for t in item.split(",") if t.strip()),
     )
     sys.exit(run(opts, store, log))

@@ -339,3 +339,73 @@ def test_request_during_idle_stop_restarts_the_server(env):
     assert not alive(first)
     assert env.starts()[-1] != first
     w.close()
+
+
+def test_client_ids_with_the_internal_prefix_get_their_replies(env):
+    primed(env)
+    w = env.wrapper("--idle", "1s")
+    w.legacy_connect()
+    resp = w.request("tools/call", {"name": "echo", "arguments": {"z": 1}}, id_="mcp-hotswap:client-123")
+    assert json.loads(text_of(resp)) == {"z": 1}
+    pid = env.starts()[-1]
+    assert wait_until(lambda: not alive(pid), 5), "the request must not stay in flight"
+    w.close()
+
+
+def test_server_ping_during_handshake_replay_is_answered(env):
+    env.vars["FAKE_PING_ON_INIT"] = "1"
+    primed(env)
+    w = env.wrapper("--start-timeout", "5s")
+    w.legacy_connect()
+    resp = w.call("echo", {"p": 1})
+    assert json.loads(text_of(resp)) == {"p": 1}
+    assert len(env.starts()) == 2
+    w.close()
+
+
+def test_failed_refresh_after_list_changed_never_serves_stale(env, tmp_path):
+    tools_file = tmp_path / "tools.json"
+    tools_file.write_text(json.dumps(["echo", "add_tool"]))
+    env.vars.update(FAKE_TOOLS=str(tools_file), FAKE_LIST_CHANGED="1")
+    primed(env)
+    w = env.wrapper()
+    w.legacy_connect()
+    w.call("add_tool", {"name": "fresh", "break_list": True})
+    w.wait_for(lambda m: m.get("method") == "notifications/tools/list_changed")
+    assert wait_until(lambda: "refresh-failed" in env.debug(), 5)
+    # The live server is asked (and fails) rather than the stale cache answering.
+    assert w.request("tools/list")["error"]["code"] == -32603
+    w.close()
+    # The stale entry is gone: the next session asks a real server.
+    w = env.wrapper()
+    _, tools = w.legacy_connect()
+    w.close()
+    assert "fresh" in [t["name"] for t in tools["result"]["tools"]]
+    assert len(env.starts()) == 3
+
+
+def test_pinned_tools_disable_idle_stop(env):
+    primed(env)
+    w = env.wrapper("--idle", "0.5s", "--pin", "counter,ask_roots", "--pin", "sleep")
+    w.legacy_connect()
+    w.call("echo")
+    first = env.starts()[-1]
+    assert wait_until(lambda: not alive(first), 5), "unpinned tools still allow idle stop"
+    w.call("counter")
+    second = env.starts()[-1]
+    time.sleep(2.0)
+    assert alive(second), "a pinned tool keeps the server for the session"
+    assert text_of(w.call("counter")) == "2"  # state kept
+    assert "pinned tool=counter" in env.debug()
+    w.close()
+
+
+def test_pin_from_any_listed_flag(env):
+    primed(env)
+    w = env.wrapper("--idle", "0.5s", "--pin", "counter", "--pin", "sleep")
+    w.legacy_connect()
+    w.call("sleep", {"seconds": 0.1})
+    pid = env.starts()[-1]
+    time.sleep(1.5)
+    assert alive(pid)
+    w.close()

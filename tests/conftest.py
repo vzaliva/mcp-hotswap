@@ -90,16 +90,23 @@ class Wrapper:
         self.inbox: queue.Queue = queue.Queue()
         self.seen: list = []
         self.next_id = 100
+        self.answer_pings = True
+        self.write_lock = threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
         for line in self.proc.stdout:
-            self.inbox.put(json.loads(line))
+            msg = json.loads(line)
+            if self.answer_pings and msg.get("method") == "ping" and "id" in msg:
+                self.send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+                continue
+            self.inbox.put(msg)
         self.inbox.put(None)
 
     def send(self, msg):
-        self.proc.stdin.write((json.dumps(msg) + "\n").encode())
-        self.proc.stdin.flush()
+        with self.write_lock:
+            self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+            self.proc.stdin.flush()
 
     def notify(self, method, params=None):
         msg = {"jsonrpc": "2.0", "method": method}

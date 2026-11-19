@@ -246,6 +246,24 @@ class Cache:
         finally:
             os.close(fd)
 
+    def forget(self, keys) -> None:
+        """Drop entries (replies known to be stale that could not be re-fetched)."""
+        if not self.enabled:
+            return
+        lock_path = self.path + ".lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            entries = self._read()
+            gone = [k for k in keys if k in entries]
+            for k in gone:
+                del entries[k]
+            if gone:
+                self._write(entries)
+            self.entries = entries
+        finally:
+            os.close(fd)
+
     def _write(self, entries: dict) -> None:
         data = {"format": FORMAT, "identity": self.ident, "entries": entries}
         directory = os.path.dirname(self.path)
