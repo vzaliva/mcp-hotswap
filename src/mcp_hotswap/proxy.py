@@ -110,6 +110,7 @@ class Proxy:
         self.collect_fd: int | None = None
         self.dirty: set[str] = set()  # lists the server said changed, not yet re-fetched
         self.refresh_tasks: set[asyncio.Task] = set()
+        self.expired: set[str] = set()  # internal ids that timed out; late replies are dropped
         self.pinned = False  # a --pin tool was called: no idle stop for this server
         # Internal ids carry a per-process random part, so a client cannot
         # pick one by accident; replies are routed by exact id, not prefix.
@@ -410,12 +411,8 @@ class Proxy:
                 self.client_init = msg
             elif method == "logging/setLevel" and isinstance(msg.get("params"), dict):
                 self.log_level = msg["params"]
-            elif method == "tools/call" and self.opts.pin and not self.pinned:
-                params = msg.get("params")
-                name = params.get("name") if isinstance(params, dict) else None
-                if name in self.opts.pin:
-                    self.pinned = True
-                    self.log("pinned", tool=name)
+            elif method == "tools/call":
+                self._check_pin(msg)
         elif method == "notifications/initialized":
             self.client_initialized = True
         self._touch()
@@ -426,6 +423,17 @@ class Proxy:
             for item in batch:
                 if isinstance(item, dict) and "method" in item and "id" in item:
                     self.client_pending[idkey(item["id"])] = Pending(None)
+                    if item.get("method") == "tools/call":
+                        self._check_pin(item)
+
+    def _check_pin(self, msg: dict) -> None:
+        if not self.opts.pin or self.pinned:
+            return
+        params = msg.get("params")
+        name = params.get("name") if isinstance(params, dict) else None
+        if name in self.opts.pin:
+            self.pinned = True
+            self.log("pinned", tool=name)
 
     # ------------------------------------------------------------- start/stop
 
@@ -531,6 +539,7 @@ class Proxy:
         self.server_pending.clear()
         self.pages.clear()
         self.dirty.clear()
+        self.expired.clear()
         self.pinned = False  # whatever it held is gone with it
         self._end_collect()
         if self.state == "closing":
@@ -584,11 +593,17 @@ class Proxy:
         method = msg.get("method")
         if method is None:
             id_ = msg.get("id")
-            if isinstance(id_, str) and id_ in self.internal and idkey(id_) not in self.client_pending:
-                fut = self.internal.pop(id_)
-                if not fut.done():
-                    fut.set_result(msg)
-                return
+            if isinstance(id_, str) and idkey(id_) not in self.client_pending:
+                if id_ in self.internal:
+                    fut = self.internal.pop(id_)
+                    if not fut.done():
+                        fut.set_result(msg)
+                    return
+                if id_ in self.expired:
+                    # We gave up waiting; the client never sent this id.
+                    self.expired.discard(id_)
+                    self.log("late-internal-reply", id=id_)
+                    return
             self._touch()
             pending = self.client_pending.pop(idkey(id_), None)
             await self._to_client(raw)
@@ -674,6 +689,7 @@ class Proxy:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
             self.log("internal-timeout", method=method)
+            self.expired.add(id_)
             return None
         finally:
             self.internal.pop(id_, None)
@@ -728,7 +744,13 @@ class Proxy:
             put[handshake[0]] = handshake[1]
             self.handshake_reply = None
         failed: list[str] = []
-        for key in list(self.cache.entries):
+        # Everything the cache holds, plus what this client was served: a
+        # changed handshake may already have dropped those entries from the
+        # file, but the client still holds the old replies and must hear
+        # about changes.
+        keys = list(self.cache.entries)
+        keys += [k for k in self.served if k not in self.cache.entries]
+        for key in keys:
             if self.child is not child or self.state == "closing":
                 return
             v, method, params = C.key_parts(key)

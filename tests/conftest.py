@@ -97,6 +97,10 @@ class Wrapper:
     def _read(self):
         for line in self.proc.stdout:
             msg = json.loads(line)
+            if isinstance(msg, list):  # a batch response: deliver its parts
+                for part in msg:
+                    self.inbox.put(part)
+                continue
             if self.answer_pings and msg.get("method") == "ping" and "id" in msg:
                 self.send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
                 continue

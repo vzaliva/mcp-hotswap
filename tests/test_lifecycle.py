@@ -409,3 +409,73 @@ def test_pin_from_any_listed_flag(env):
     time.sleep(1.5)
     assert alive(pid)
     w.close()
+
+
+def test_server_upgrade_with_new_catalog_notifies_the_client(env, tmp_path):
+    """A version bump plus a new tool: the refresh still re-checks the list
+    the client was served and tells it, even though the changed handshake
+    already dropped the old entries from the cache file."""
+    tools_file = tmp_path / "tools.json"
+    tools_file.write_text(json.dumps(["echo"]))
+    env.vars.update(FAKE_TOOLS=str(tools_file), FAKE_LIST_CHANGED="1")
+    primed(env)
+    tools_file.write_text(json.dumps(["echo", "newtool"]))
+    env.vars["FAKE_VERSION"] = "2.0"
+    w = env.wrapper()
+    _, tools = w.legacy_connect()
+    assert [t["name"] for t in tools["result"]["tools"]] == ["echo"]
+    w.call("echo")
+    w.wait_for(lambda m: m.get("method") == "notifications/tools/list_changed")
+    assert [t["name"] for t in w.request("tools/list")["result"]["tools"]] == ["echo", "newtool"]
+    pid = env.starts()[-1]
+    assert any(m.get("method") == "tools/list" for m in env.received(pid))
+    w.close()
+    w = env.wrapper()
+    init, tools = w.legacy_connect()
+    w.close()
+    assert init["result"]["serverInfo"]["version"] == "2.0"
+    assert [t["name"] for t in tools["result"]["tools"]] == ["echo", "newtool"]
+    assert len(env.starts()) == 2
+
+
+def test_pin_applies_to_batched_calls(env):
+    primed(env)
+    w = env.wrapper("--idle", "0.3s", "--pin", "counter")
+    w.legacy_connect()
+    w.send([{"jsonrpc": "2.0", "id": 900, "method": "tools/call",
+             "params": {"name": "counter", "arguments": {}}}])  # queued while starting
+    assert text_of(w.wait_response(900)) == "1"
+    pid = env.starts()[-1]
+    time.sleep(1.2)
+    assert alive(pid), "a pinned tool in a batch pins the server"
+    w.send([{"jsonrpc": "2.0", "id": 901, "method": "tools/call",
+             "params": {"name": "counter", "arguments": {}}}])  # while running
+    assert text_of(w.wait_response(901)) == "2"
+    w.close()
+
+
+def test_pin_applies_to_batch_sent_while_running(env):
+    primed(env)
+    w = env.wrapper("--idle", "0.3s", "--pin", "counter")
+    w.legacy_connect()
+    w.call("echo")
+    w.send([{"jsonrpc": "2.0", "id": 902, "method": "tools/call",
+             "params": {"name": "counter", "arguments": {}}}])
+    w.wait_response(902)
+    pid = env.starts()[-1]
+    time.sleep(1.2)
+    assert alive(pid)
+    w.close()
+
+
+def test_late_reply_to_timed_out_internal_request_is_not_leaked(env):
+    primed(env)
+    env.vars["FAKE_START_DELAY"] = "0.4"
+    w = env.wrapper("--start-timeout", "0.1s", "--stop-grace", "1s")
+    w.legacy_connect()
+    resp = w.call("echo")
+    assert resp["error"]["code"] == -32603
+    seen = w.drain(1.5)
+    assert not [m for m in seen if str(m.get("id", "")).startswith("mcp-hotswap:")], seen
+    assert wait_until(lambda: "late-internal-reply" in env.debug(), 3)
+    w.close()

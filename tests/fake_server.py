@@ -38,7 +38,14 @@ def log(ev, **kw):
             f.write(json.dumps({"ev": ev, "pid": os.getpid(), "t": time.time(), **kw}) + "\n")
 
 
+batch = threading.local()  # while answering a batch, replies are collected here
+
+
 def send(msg):
+    sink = getattr(batch, "replies", None)
+    if sink is not None and isinstance(msg, dict) and "method" not in msg:
+        sink.append(msg)
+        return
     data = json.dumps(msg) + "\n"
     with lock:
         sys.stdout.write(data)
@@ -199,7 +206,10 @@ def handle(msg):
     if method == "tools/list":
         list_tools(id_, params, modern)
     elif method == "tools/call":
-        threading.Thread(target=call_tool, args=(id_, params, modern), daemon=True).start()
+        if getattr(batch, "replies", None) is not None:
+            call_tool(id_, params, modern)  # inside a batch: answer in this thread
+        else:
+            threading.Thread(target=call_tool, args=(id_, params, modern), daemon=True).start()
     elif method == "logging/setLevel":
         reply(id_, {})
     else:
@@ -224,6 +234,14 @@ def main():
     for line in sys.stdin:
         msg = json.loads(line)
         log("recv", msg=msg)
+        if isinstance(msg, list):  # JSON-RPC batch: one array of responses
+            batch.replies = []
+            for item in msg:
+                handle(item)
+            replies, batch.replies = batch.replies, None
+            if replies:
+                send(replies)
+            continue
         handle(msg)
     log("eof")
     if os.environ.get("FAKE_IGNORE_EOF"):

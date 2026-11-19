@@ -101,8 +101,9 @@ protocol era:
   `notifications/initialized` (if the client sent it) and the remembered
   `logging/setLevel`. Internal ids are `mcp-hotswap:<random>:<n>`, never
   equal to an outstanding client id. A server reply goes to the wrapper only
-  if its id exactly matches an outstanding internal request; any other reply,
-  even one whose id starts with `mcp-hotswap:`, goes to the client. If
+  if its id exactly matches an outstanding internal request, or one that
+  timed out (a late reply is dropped, not leaked to the client). Any other
+  reply, even one whose id starts with `mcp-hotswap:`, goes to the client. If
   the server asks the client something (e.g. a ping) before it answers the
   replayed `initialize`, the client's answer is relayed at once, not queued. If the
   server rejects `initialize`, the error goes back to every queued request
@@ -130,7 +131,9 @@ request, and would then refuse the session.
   at once (dropping entries that cannot be re-checked), before the queued
   requests are released. A session that ends straight after its first call
   still leaves a corrected cache. At client EOF the wrapper also gives a
-  running refresh up to 2 s to finish.
+  running refresh up to 2 s to finish. The refresh re-checks everything the
+  client was served as well as what the cache file still holds, so the lists
+  dropped this way are fetched again and compared.
 - **Something changed**: the cache is rewritten, and entries that could not
   be re-checked (other versions, the other era's probe) are dropped, to be
   learned again from the real server the next time a client asks. This is
@@ -155,8 +158,8 @@ internal requests, queued requests), and nothing has been relayed for `T`.
 client that polls them neither starts the server nor keeps it alive.
 
 `--pin TOOL[,TOOL...]` (repeatable) names tools that create state the
-server must keep. Once a `tools/call` for one of them is forwarded, idle
-stop is off for that server process. The pin ends only when the process
+server must keep. Once a `tools/call` for one of them is forwarded (alone
+or inside a batch), idle stop is off for that server process. The pin ends only when the process
 ends for another reason (crash or session end), because the state is then
 gone anyway. For scholar-mcp, pinning `ingest_paper_fulltext` covers the
 ingestion jobs, which keep running after the call has answered, so the
